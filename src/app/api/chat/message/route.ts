@@ -1,51 +1,92 @@
-import { prisma } from "@/lib/prisma"
-import { NextRequest, NextResponse } from "next/server"
-import { OpenAI } from "openai"
+import { prisma } from "@/lib/prisma"; // Ajuste o caminho se for diferente
+import { NextRequest, NextResponse } from "next/server";
+import { OpenAI } from "openai";
 
+// Instancia o cliente da OpenAI
 const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY
-})
+  apiKey: process.env.OPENAI_API_KEY,
+});
 
+/**
+ * Endpoint para processar mensagens de chat usando a Responses API da OpenAI.
+ */
 export async function POST(req: NextRequest) {
-  const { chatId, sender, content, assistantId } = await req.json()
+  try {
+    // 1. Extrai os dados da requisição.
+    // Os IDs no seu schema são Int, o JSON os tratará como number.
+    const { chatId, content, assistantId }: { chatId: number; content: string; assistantId: number; } = await req.json();
 
-  // Salva a mensagem do usuário
-  const userMessage = await prisma.message.create({
-    data: { chatId, sender, content }
-  })
+    // Validação da entrada
+    if (!chatId || !content || !assistantId) {
+      return NextResponse.json(
+        { error: "chatId, content, e assistantId são obrigatórios." },
+        { status: 400 }
+      );
+    }
 
-  // Busca persona do assistente
-  const assistant = await prisma.assistant.findUnique({ where: { id: assistantId } })
+    // 2. Salva a mensagem do usuário no banco de dados.
+    const userMessage = await prisma.message.create({
+      data: {
+        chatId: chatId,
+        sender: "user",
+        content: content,
+      },
+    });
 
-  // Busca TODO o histórico de mensagens desse chat
-  const history = await prisma.message.findMany({
-    where: { chatId },
-    orderBy: { createdAt: 'asc' } // importante para manter ordem correta
-  })
+    // 3. Busca a persona do assistente e o estado atual do chat em paralelo.
+    const [assistant, chat] = await Promise.all([
+      prisma.assistant.findUnique({ where: { id: assistantId } }),
+      prisma.chat.findUnique({ where: { id: chatId } }),
+    ]);
 
-  // Monta o array para o OpenAI (system, user, assistant...)
-  const openaiMessages = [
-    { role: "system" as const, content: assistant?.persona ?? "" },
-    ...history.map(msg => ({
-      role: msg.sender === "user" ? ("user" as const) : ("assistant" as const),
-      content: msg.content
-    })),
-    // NÃO inclua novamente a mensagem recém salva, pois ela já estará no history
-  ]
+    // Valida se o assistente e o chat existem
+    if (!assistant) {
+      return NextResponse.json({ error: "Assistente não encontrado." }, { status: 404 });
+    }
+    if (!chat) {
+      return NextResponse.json({ error: "Chat não encontrado." }, { status: 404 });
+    }
 
-  // Faz a requisição pro GPT usando o histórico completo
-  const gptResponse = await openai.chat.completions.create({
-    model: "gpt-3.5-turbo",
-    messages: openaiMessages,
-    max_tokens: 200,
-    temperature: 0.7
-  })
-  const assistantMessageContent = gptResponse.choices[0].message.content?.trim() || "Não entendi."
+    // 4. Chama a API Responses da OpenAI para gerar a resposta.
+    const gptResponse = await openai.responses.create({
+      model: "gpt-4o",
+      input: content,
+      instructions: assistant.persona || "Você é um assistente prestativo.",
+      // A chave da memória: usa o ID da resposta anterior, que está salvo no nosso DB.
+      previous_response_id: chat.lastResponseId || null,
+      store: true,
+    });
 
-  // Salva resposta do assistente
-  const assistantMessage = await prisma.message.create({
-    data: { chatId, sender: "assistant", content: assistantMessageContent }
-  })
+    // 5. Extrai o conteúdo de texto da resposta.
+    const output = gptResponse.output?.[0];
+    let assistantMessageContent = "Não foi possível gerar uma resposta.";
+    if (output?.type === 'message' && output.content?.[0]?.type === 'output_text') {
+      assistantMessageContent = output.content[0].text;
+    }
 
-  return NextResponse.json({ userMessage, assistantMessage })
+    // 6. Salva a resposta do assistente no banco de dados.
+    const assistantMessage = await prisma.message.create({
+      data: {
+        chatId: chatId,
+        sender: "assistant",
+        content: assistantMessageContent,
+      },
+    });
+
+    // 7. ATUALIZA o chat com o ID da nova resposta. Essencial para a próxima interação.
+    await prisma.chat.update({
+      where: { id: chatId },
+      data: { lastResponseId: gptResponse.id },
+    });
+
+    // 8. Retorna a confirmação para o frontend.
+    return NextResponse.json({ userMessage, assistantMessage });
+
+  } catch (error) {
+    console.error("Erro no endpoint do chat:", error);
+    return NextResponse.json(
+      { error: "Ocorreu um erro interno no servidor." },
+      { status: 500 }
+    );
+  }
 }

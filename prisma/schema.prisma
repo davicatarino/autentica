@@ -32,6 +32,10 @@ model Chat {
   userId      Int
   assistantId Int
   createdAt   DateTime  @default(now())
+  
+  // --- ADICIONE ESTA LINHA ---
+  lastResponseId String?   @db.VarChar(255) // Armazena o ID da resposta da OpenAI para dar memória ao chat
+
   assistant   Assistant @relation(fields: [assistantId], references: [id])
   user        User      @relation(fields: [userId], references: [id])
   messages    Message[]
@@ -44,7 +48,7 @@ model Message {
   id        Int      @id @default(autoincrement())
   chatId    Int
   sender    String
-  content   String @db.Text
+  content   String   @db.Text
   createdAt DateTime @default(now())
   chat      Chat     @relation(fields: [chatId], references: [id])
 
